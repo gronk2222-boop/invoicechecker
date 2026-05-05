@@ -1,600 +1,371 @@
---- glavobsnab_system/app.py (原始)
-
-
-+++ glavobsnab_system/app.py (修改后)
-"""
-app.py - Главное приложение Streamlit
-Система интеллектуального сравнения счетов для "Главоблснаб"
-"""
-
 import streamlit as st
 import pandas as pd
+import sqlite3
 import os
-import tempfile
+import io
 from datetime import datetime
-from typing import List, Dict
 import folium
-from streamlit_folium import st_folium
+from streamlit_folium import folium_static
+import requests
+from bs4 import BeautifulSoup
+import re
 
-# Импорт локальных модулей
-from database import (
-    init_database, get_or_create_client, get_or_create_supplier,
-    create_document, create_item, get_items_by_document,
-    get_items_for_comparison, add_price_history, get_price_statistics,
-    log_processing, get_all_suppliers
-)
-from parsers import parse_file, extract_items_as_dict, ParsedDocument
-from ai_engine import (
-    search_product_characteristics, check_compatibility,
-    estimate_volume_and_weight, select_transport_type,
-    calculate_delivery_cost, get_coordinates_by_address,
-    calculate_distance, analyze_supplier_locations
-)
+# Импорт локальных модулей (убедитесь, что они лежат рядом с app.py)
+try:
+    from database import init_db, save_invoice, get_price_history, get_supplier_info
+    from parsers import parse_file
+    from ai_engine import analyze_compatibility, search_product_info, calculate_logistics
+except ImportError:
+    # Заглушки для случаев, если модули еще не загружены или имена изменены
+    st.error("Ошибка импорта модулей. Убедитесь, что database.py, parsers.py и ai_engine.py находятся в той же папке.")
+    def init_db(): pass
+    def save_invoice(*args): pass
+    def get_price_history(*args): return []
+    def get_supplier_info(*args): return {}
+    def parse_file(*args): return pd.DataFrame()
+    def analyze_compatibility(*args): return []
+    def search_product_info(*args): return {}
+    def calculate_logistics(*args): return {}
 
-
-# === Конфигурация страницы ===
+# --- КОНФИГУРАЦИЯ СТРАНИЦЫ ---
 st.set_page_config(
-    page_title="Главоблснаб - Сравнение счетов",
-    page_icon="📊",
+    page_title="Главоблснаб: Умное сравнение счетов",
+    page_icon="🏗️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# === CSS стили ===
+# --- СТИЛИ (CSS) ---
 st.markdown("""
 <style>
-    .main {
+    /* Основной фон */
+    .stApp {
         background-color: #0b132b;
+        color: #ffffff;
     }
-    .stButton>button {
+    
+    /* Заголовки */
+    h1, h2, h3 {
+        color: #87ceeb !important;
+        font-family: 'Segoe UI', sans-serif;
+    }
+    
+    /* Карточки и контейнеры */
+    .css-1r6slb0, .css-1d391kg {
         background-color: #1c2541;
-        color: #87ceeb;
+        border-radius: 10px;
+        padding: 20px;
+    }
+    
+    /* Кнопки */
+    .stButton>button {
+        background-color: #3a506b;
+        color: white;
         border: 1px solid #87ceeb;
+        border-radius: 5px;
+        font-weight: bold;
     }
     .stButton>button:hover {
         background-color: #87ceeb;
         color: #0b132b;
     }
-    .metric-card {
-        background-color: #1c2541;
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 4px solid #87ceeb;
-        margin: 10px 0;
+    
+    /* Таблицы */
+    table {
+        color: white;
     }
-    .status-exact { color: #4CAF50; }
-    .status-warning { color: #FFC107; }
-    .status-error { color: #F44336; }
-    .status-info { color: #2196F3; }
-
-    h1, h2, h3 {
+    th {
+        background-color: #3a506b !important;
         color: #87ceeb !important;
     }
-    label, p, div {
-        color: #e0e0e0 !important;
-    }
+    
+    /* Статусы */
+    .status-ok { color: #4caf50; font-weight: bold; }
+    .status-warn { color: #ff9800; font-weight: bold; }
+    .status-err { color: #f44336; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
-# === Инициализация БД ===
-init_database()
+# --- ИНИЦИАЛИЗАЦИЯ БД ---
+@st.cache_resource
+def get_db_connection():
+    conn = sqlite3.connect('invoices.db', check_same_thread=False)
+    init_db(conn)
+    return conn
 
-# === Session State ===
-if 'request_data' not in st.session_state:
-    st.session_state.request_data = None
-if 'invoices_data' not in st.session_state:
-    st.session_state.invoices_data = []
-if 'comparison_results' not in st.session_state:
-    st.session_state.comparison_results = None
-if 'current_step' not in st.session_state:
-    st.session_state.current_step = 1
+conn = get_db_connection()
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def reset_session():
+    keys = ['request_data', 'invoices_data', 'client_name', 'delivery_address', 'analysis_done']
+    for key in keys:
+        if key in st.session_state:
+            del st.session_state[key]
 
-# === Вспомогательные функции ===
+def format_currency(val):
+    try:
+        return f"{val:,.2f} ₽"
+    except:
+        return str(val)
 
-def save_uploaded_file(uploaded_file) -> str:
-    """Сохранение загруженного файла во временную директорию"""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
-        tmp.write(uploaded_file.getvalue())
-        return tmp.name
+# --- ОСНОВНОЙ ИНТЕРФЕЙС ---
 
+st.title("🏗️ Система интеллектуального сравнения счетов")
+st.markdown("### Для ООО «Главоблснаб»")
 
-def process_request(file_path: str, client_name: str, delivery_address: str) -> Dict:
-    """Обработка заявки клиента"""
-    parsed_doc = parse_file(file_path)
+# Боковая панель
+with st.sidebar:
+    st.header("Меню")
+    option = st.radio("Навигация", ["Загрузка данных", "Анализ и Результаты", "История закупок"])
+    
+    if st.button("🗑️ Сбросить всё"):
+        reset_session()
+        st.rerun()
+    
+    st.info("💡 **Совет:** Загружайте файлы в форматах PDF, XLSX, DOCX или CSV.")
 
-    if not parsed_doc or not parsed_doc.items:
-        return {'error': 'Не удалось распарсить заявку'}
+# --- ШАГ 1: ЗАГРУЗКА ДАННЫХ ---
+if option == "Загрузка данных":
+    st.header("1. Параметры заявки")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        client_name = st.text_input("Имя клиента", value=st.session_state.get('client_name', ''), placeholder="Например: ЖК 'Северный'")
+    with col2:
+        delivery_address = st.text_input("Адрес доставки", value=st.session_state.get('delivery_address', ''), placeholder="Москва, ул. Строителей, д. 5")
+    
+    if client_name:
+        st.session_state['client_name'] = client_name
+    if delivery_address:
+        st.session_state['delivery_address'] = delivery_address
 
-    # Создаем клиента
-    client_id = get_or_create_client(client_name)
+    st.divider()
+    
+    st.header("2. Загрузка Заявки (Эталон)")
+    req_file = st.file_uploader("Загрузить файл заявки", type=['pdf', 'xlsx', 'xls', 'docx', 'csv', 'txt'], key="req_uploader")
+    
+    if req_file and ('request_data' not in st.session_state or st.session_state.get('req_file_name') != req_file.name):
+        with st.spinner("Обработка заявки..."):
+            try:
+                content = req_file.read()
+                df_req = parse_file(content, req_file.name)
+                if not df_req.empty:
+                    st.session_state['request_data'] = df_req
+                    st.session_state['req_file_name'] = req_file.name
+                    st.success(f"Заявка обработана! Найдено позиций: {len(df_req)}")
+                else:
+                    st.error("Не удалось извлечь данные из файла заявки.")
+            except Exception as e:
+                st.error(f"Ошибка парсинга заявки: {str(e)}")
 
-    # Создаем документ
-    doc_id = create_document(
-        doc_type='request',
-        client_id=client_id,
-        filename=os.path.basename(file_path),
-        delivery_address=delivery_address
-    )
+    if 'request_data' in st.session_state:
+        with st.expander("Просмотр заявки"):
+            st.dataframe(st.session_state['request_data'], use_container_width=True)
 
-    # Сохраняем позиции
-    items = extract_items_as_dict(parsed_doc)
-    for item_data in items:
-        item_id = create_item(document_id=doc_id, **item_data)
-        # Добавляем в историю цен
-        if item_data.get('price_per_unit'):
-            add_price_history(
-                item_name=item_data['name'],
-                supplier_id=None,
-                price_per_unit=item_data['price_per_unit'],
-                quantity=item_data['quantity'],
-                document_id=doc_id
-            )
+    st.divider()
+    
+    st.header("3. Загрузка счетов поставщиков")
+    st.markdown("Можно загрузить несколько файлов одновременно.")
+    inv_files = st.file_uploader("Файлы счетов", type=['pdf', 'xlsx', 'xls', 'docx', 'csv', 'txt'], accept_multiple_files=True, key="inv_uploader")
+    
+    if inv_files:
+        invoices = []
+        progress_bar = st.progress(0)
+        
+        for i, file in enumerate(inv_files):
+            try:
+                content = file.read()
+                df_inv = parse_file(content, file.name)
+                if not df_inv.empty:
+                    df_inv['source_file'] = file.name
+                    invoices.append(df_inv)
+                progress_bar.progress((i + 1) / len(inv_files))
+            except Exception as e:
+                st.warning(f"Ошибка в файле {file.name}: {str(e)}")
+        
+        if invoices:
+            st.session_state['invoices_data'] = invoices
+            st.success(f"Загружено счетов: {len(invoices)}")
+            
+            with st.expander("Просмотр загруженных счетов"):
+                all_inv_df = pd.concat(invoices, ignore_index=True)
+                st.dataframe(all_inv_df, use_container_width=True)
 
-    log_processing(doc_id, 'success', f'Заявка обработана: {len(items)} позиций')
+    # Кнопка перехода
+    col_left, col_right, _ = st.columns([1, 1, 3])
+    with col_right:
+        if st.button("Перейти к анализу ➡️", disabled=('request_data' not in st.session_state or 'invoices_data' not in st.session_state)):
+            st.session_state['page'] = "analysis"
+            st.rerun()
 
-    return {
-        'doc_id': doc_id,
-        'client_name': client_name,
-        'delivery_address': delivery_address,
-        'items': items,
-        'total_amount': sum(item.get('total_price', 0) or item.get('quantity', 0) * item.get('price_per_unit', 0) for item in items)
-    }
+# --- ШАГ 2: АНАЛИЗ И РЕЗУЛЬТАТЫ ---
+elif option == "Анализ и Результаты" or st.session_state.get('page') == "analysis":
+    if 'request_data' not in st.session_state or 'invoices_data' not in st.session_state:
+        st.warning("Сначала загрузите заявку и счета на вкладке 'Загрузка данных'.")
+        st.stop()
 
-
-def process_invoice(file_path: str, delivery_address: str) -> Dict:
-    """Обработка счета поставщика"""
-    parsed_doc = parse_file(file_path)
-
-    if not parsed_doc or not parsed_doc.items:
-        return {'error': 'Не удалось распарсить счет'}
-
-    # Определяем поставщика
-    supplier_name = parsed_doc.supplier_name or os.path.basename(file_path)
-    supplier_id = get_or_create_supplier(
-        name=supplier_name,
-        address=parsed_doc.supplier_address,
-        free_delivery=parsed_doc.free_delivery
-    )
-
-    # Создаем документ
-    doc_id = create_document(
-        doc_type='invoice',
-        supplier_id=supplier_id,
-        filename=os.path.basename(file_path),
-        delivery_address=delivery_address,
-        total_amount=parsed_doc.total_amount
-    )
-
-    # Сохраняем позиции
-    items = extract_items_as_dict(parsed_doc)
-    for item_data in items:
-        item_id = create_item(document_id=doc_id, **item_data)
-        # Добавляем в историю цен
-        if item_data.get('price_per_unit'):
-            add_price_history(
-                item_name=item_data['name'],
-                supplier_id=supplier_id,
-                price_per_unit=item_data['price_per_unit'],
-                quantity=item_data['quantity'],
-                document_id=doc_id
-            )
-
-    log_processing(doc_id, 'success', f'Счет обработан: {len(items)} позиций')
-
-    return {
-        'doc_id': doc_id,
-        'supplier_name': supplier_name,
-        'supplier_address': parsed_doc.supplier_address,
-        'items': items,
-        'total_amount': parsed_doc.total_amount,
-        'delivery_cost': parsed_doc.delivery_cost,
-        'free_delivery': parsed_doc.free_delivery
-    }
-
-
-def compare_request_with_invoices(request_items: List[Dict], invoices: List[Dict]) -> List[Dict]:
-    """Сравнение заявки со счетами"""
-    results = []
-
-    for idx, invoice in enumerate(invoices):
-        comparison = get_items_for_comparison(request_items, invoice['items'])
-
-        # Рассчитываем логистику
-        total_volume, total_weight = estimate_volume_and_weight(invoice['items'])
-        transport_info = select_transport_type(total_volume, total_weight)
-
-        # Получаем координаты для расчета доставки
-        supplier_coords = get_coordinates_by_address(invoice.get('supplier_address', ''))
-        delivery_coords = get_coordinates_by_address(st.session_state.request_data.get('delivery_address', ''))
-        distance = calculate_distance(supplier_coords, delivery_coords)
-
-        # Расчет доставки
-        delivery_cost = calculate_delivery_cost(
-            distance_km=distance,
-            transport_info=transport_info,
-            free_delivery=invoice.get('free_delivery', False),
-            delivery_included=invoice.get('delivery_cost')
-        )
-
-        # Проверка совместимости
-        compatibility_warnings = check_compatibility(invoice['items'])
-
-        # Анализ истории цен
-        price_analysis = []
-        for item in invoice['items']:
-            stats = get_price_statistics(item['name'])
-            if stats.get('avg_price') and item.get('price_per_unit'):
-                diff_percent = ((item['price_per_unit'] - stats['avg_price']) / stats['avg_price']) * 100
-                price_analysis.append({
-                    'item_name': item['name'],
-                    'current_price': item['price_per_unit'],
-                    'avg_price': stats['avg_price'],
-                    'diff_percent': diff_percent,
-                    'trend': stats['trend']
+    st.header("Результаты сравнения")
+    
+    with st.spinner("ИИ анализирует совместимость, ищет характеристики и считает логистику..."):
+        # 1. Объединение данных для анализа
+        req_df = st.session_state['request_data']
+        inv_list = st.session_state['invoices_data']
+        
+        results = []
+        
+        # Простой алгоритм сравнения (в реальном проекте вынести в ai_engine)
+        for inv_df in inv_list:
+            supplier_name = inv_df['source_file'].iloc[0] if 'source_file' in inv_df.columns else "Неизвестно"
+            
+            # Попытка найти поставщика в названии файла или реквизитах
+            # Здесь упрощенно берем имя файла
+            
+            total_score = 0
+            matched_items = 0
+            
+            for idx, row in req_df.iterrows():
+                req_item = str(row.get('name', '')).lower()
+                req_qty = float(row.get('quantity', 0))
+                
+                # Поиск похожей позиции в счете
+                found = False
+                best_match = None
+                best_ratio = 0
+                
+                for _, inv_row in inv_df.iterrows():
+                    inv_item = str(inv_row.get('name', '')).lower()
+                    # Простое сравнение строк (можно улучшить через fuzzy matching)
+                    if req_item in inv_item or inv_item in req_item or req_item.split()[0] == inv_item.split()[0]:
+                        ratio = len(set(req_item.split()) & set(inv_item.split())) / len(set(req_item.split()) | set(inv_item.split()))
+                        if ratio > best_ratio:
+                            best_ratio = ratio
+                            best_match = inv_row
+                
+                status = "❌ Нет в счете"
+                price_diff = 0
+                qty_diff = 0
+                
+                if best_match and best_ratio > 0.4:
+                    found = True
+                    matched_items += 1
+                    inv_qty = float(best_match.get('quantity', 0))
+                    inv_price = float(best_match.get('price', 0))
+                    req_price_est = float(row.get('price', 0)) if 'price' in row else 0
+                    
+                    qty_diff = inv_qty - req_qty
+                    if req_price_est > 0:
+                        price_diff = ((inv_price - req_price_est) / req_price_est) * 100
+                    
+                    if abs(qty_diff) < 0.1 and abs(price_diff) < 5:
+                        status = "✅ Точное совпадение"
+                        total_score += 10
+                    elif abs(qty_diff) < 1.0:
+                        status = "⚠️ Аналог/Расхождение"
+                        total_score += 5
+                    else:
+                        status = "⚠️ Сильное расхождение"
+                
+                results.append({
+                    "Поставщик": supplier_name,
+                    "Товар": row.get('name'),
+                    "Статус": status,
+                    "Цена в счете": best_match.get('price', 0) if found else 0,
+                    "Дельта цены %": round(price_diff, 2),
+                    "Кол-во (план/факт)": f"{req_qty} / {best_match.get('quantity', 0) if found else 0}"
                 })
 
-        # Итоговая сумма с доставкой
-        invoice_total = invoice.get('total_amount', 0) or sum(
-            item.get('total_price', 0) or item.get('quantity', 0) * item.get('price_per_unit', 0)
-            for item in invoice['items']
-        )
-        grand_total = invoice_total + delivery_cost
+        res_df = pd.DataFrame(results)
+        
+        # 2. Расчет логистики (имитация для примера)
+        logistics_info = calculate_logistics(req_df, st.session_state.get('delivery_address', 'Москва'))
+        
+        # 3. Проверка совместимости
+        compatibility_warnings = analyze_compatibility(req_df)
 
-        results.append({
-            'invoice_idx': idx,
-            'supplier_name': invoice['supplier_name'],
-            'items_comparison': comparison,
-            'invoice_total': invoice_total,
-            'delivery_cost': delivery_cost,
-            'grand_total': grand_total,
-            'total_volume_m3': total_volume,
-            'total_weight_kg': total_weight,
-            'transport_type': transport_info['recommended']['type'],
-            'distance_km': distance,
-            'compatibility_warnings': compatibility_warnings,
-            'price_analysis': price_analysis,
-            'free_delivery': invoice.get('free_delivery', False)
-        })
+    st.subheader("📊 Сводная таблица")
+    
+    # Фильтры
+    status_filter = st.multiselect("Фильтр по статусу", res_df["Статус"].unique(), default=res_df["Статус"].unique())
+    filtered_df = res_df[res_df["Статус"].isin(status_filter)]
+    
+    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+    
+    st.divider()
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🚚 Логистика и Доставка")
+        if logistics_info:
+            st.json(logistics_info) # Вывод в формате JSON для наглядности
+            st.info(f"Рекомендуемый транспорт: **{logistics_info.get('vehicle', 'Не определен')}**")
+        else:
+            st.write("Нет данных для расчета логистики.")
 
-    return results
+    with col2:
+        st.subheader("⚠️ Совместимость материалов")
+        if compatibility_warnings:
+            for warn in compatibility_warnings:
+                st.error(warn)
+        else:
+            st.success("Конфликтов совместимости не выявлено.")
 
-
-def render_status_badge(status: str) -> str:
-    """Рендеринг бейджа статуса"""
-    badges = {
-        'exact_match': '<span class="status-exact">✅ Точное совпадение</span>',
-        'quantity_diff': '<span class="status-warning">⚠️ Разница в количестве</span>',
-        'price_increase': '<span class="status-error">📈 Цена выше</span>',
-        'price_decrease': '<span class="status-info">📉 Цена ниже</span>',
-        'missing': '<span class="status-error">❌ Отсутствует</span>',
-        'extra': '<span class="status-info">🆕 Лишняя позиция</span>'
-    }
-    return badges.get(status, status)
-
-
-# === Основной интерфейс ===
-
-st.title("🏗️ Главоблснаб - Система сравнения счетов")
-st.markdown("---")
-
-# Прогресс-бар шагов
-progress_col1, progress_col2, progress_col3 = st.columns(3)
-with progress_col1:
-    if st.session_state.current_step >= 1:
-        st.success("**Шаг 1:** Заявка")
-    else:
-        st.info("Шаг 1: Заявка")
-with progress_col2:
-    if st.session_state.current_step >= 2:
-        st.success("**Шаг 2:** Счета")
-    else:
-        st.info("Шаг 2: Счета")
-with progress_col3:
-    if st.session_state.current_step >= 3:
-        st.success("**Шаг 3:** Результат")
-    else:
-        st.info("Шаг 3: Результат")
-
-st.markdown("---")
-
-# === ШАГ 1: Загрузка заявки ===
-st.header("📋 Шаг 1: Заявка клиента")
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    request_file = st.file_uploader(
-        "Загрузите файл заявки (PDF, XLSX, DOCX, CSV, TXT)",
-        type=['pdf', 'xlsx', 'xls', 'docx', 'doc', 'csv', 'txt'],
-        key='request_uploader'
-    )
-
-with col2:
-    client_name = st.text_input("Имя клиента *", placeholder="ООО 'СтройМонтаж'")
-    delivery_address = st.text_area("Адрес доставки *", placeholder="г. Москва, ул. Примерная, д. 10")
-
-if st.button("Обработать заявку", disabled=not (request_file and client_name and delivery_address)):
-    with st.spinner("Обработка заявки..."):
-        try:
-            file_path = save_uploaded_file(request_file)
-            result = process_request(file_path, client_name, delivery_address)
-
-            if 'error' in result:
-                st.error(f"Ошибка: {result['error']}")
-            else:
-                st.session_state.request_data = result
-                st.session_state.current_step = 2
-                st.success(f"✅ Заявка обработана! Найдено позиций: {len(result['items'])}")
-                os.unlink(file_path)
-                st.rerun()
-        except Exception as e:
-            st.error(f"Ошибка обработки: {str(e)}")
-
-# Отображение данных заявки если обработана
-if st.session_state.request_
-    st.subheader("📦 Позиции заявки")
-    req_df = pd.DataFrame(st.session_state.request_data['items'])
-    if not req_df.empty:
-        st.dataframe(
-            req_df[['name', 'quantity', 'unit', 'price_per_unit', 'total_price']],
-            use_container_width=True
-        )
-
-    st.metric("Общая сумма заявки", f"{st.session_state.request_data['total_amount']:,.2f} ₽")
-
-# === ШАГ 2: Загрузка счетов ===
-if st.session_state.request_
-    st.markdown("---")
-    st.header("📄 Шаг 2: Счета от поставщиков")
-
-    invoice_files = st.file_uploader(
-        "Загрузите один или несколько счетов",
-        type=['pdf', 'xlsx', 'xls', 'docx', 'doc', 'csv', 'txt'],
-        accept_multiple_files=True,
-        key='invoice_uploader'
-    )
-
-    if st.button("Обработать счета и сравнить", disabled=not invoice_files):
-        with st.spinner("Обработка счетов..."):
-            try:
-                invoices = []
-                for inv_file in invoice_files:
-                    file_path = save_uploaded_file(inv_file)
-                    result = process_invoice(file_path, st.session_state.request_data['delivery_address'])
-
-                    if 'error' not in result:
-                        invoices.append(result)
-                        st.success(f"✅ Счет от {result['supplier_name']} обработан")
-                    else:
-                        st.warning(f"⚠️ Счет не обработан: {result.get('error')}")
-
-                    os.unlink(file_path)
-
-                if invoices:
-                    st.session_state.invoices_data = invoices
-
-                    # Запуск сравнения
-                    with st.spinner("Сравнение и анализ..."):
-                        comparison = compare_request_with_invoices(
-                            st.session_state.request_data['items'],
-                            invoices
-                        )
-                        st.session_state.comparison_results = comparison
-                        st.session_state.current_step = 3
-                        st.rerun()
-
-            except Exception as e:
-                st.error(f"Ошибка: {str(e)}")
-
-# === ШАГ 3: Результаты ===
-if st.session_state.comparison_results:
-    st.markdown("---")
-    st.header("📊 Шаг 3: Результаты сравнения")
-
-    results = st.session_state.comparison_results
-
-    # Карточки с итогами по каждому счету
-    st.subheader("💰 Сводка по поставщикам")
-
-    cols = st.columns(len(results))
-
-    # Находим лучший вариант
-    best_idx = min(range(len(results)), key=lambda i: results[i]['grand_total'])
-
-    for idx, col in enumerate(cols):
-        with col:
-            result = results[idx]
-            is_best = idx == best_idx
-
-            card_color = "#2d4a22" if is_best else "#1c2541"
-
-            st.markdown(f"""
-            <div class="metric-card" style="background-color: {card_color}; border-left-color: {'#4CAF50' if is_best else '#87ceeb'};">
-                <h4>{result['supplier_name'][:20]}{'...' if len(result['supplier_name']) > 20 else ''}</h4>
-                <p>Товары: {result['invoice_total']:,.0f} ₽</p>
-                <p>Доставка: {result['delivery_cost']:,.0f} ₽</p>
-                <h3 style="color: {'#4CAF50' if is_best else '#87ceeb'};">Итого: {result['grand_total']:,.0f} ₽</h3>
-                {'🏆 Лучший выбор!' if is_best else ''}
-            </div>
-            """, unsafe_allow_html=True)
-
-    # Детальная таблица сравнения
-    st.subheader("📋 Детальное сравнение позиций")
-
-    # Выбор поставщика для детального просмотра
-    supplier_options = [r['supplier_name'] for r in results]
-    selected_supplier = st.selectbox("Выберите поставщика для просмотра", supplier_options)
-
-    selected_result = next(r for r in results if r['supplier_name'] == selected_supplier)
-
-    # Таблица сравнения
-    comparison_data = []
-    for item_comp in selected_result['items_comparison']:
-        comparison_data.append({
-            'Позиция': item_comp['item_name'],
-            'Статус': render_status_badge(item_comp['status']),
-            'Заявка (кол-во)': item_comp['request_qty'],
-            'Счет (кол-во)': item_comp['invoice_qty'],
-            'Δ кол-во': f"{item_comp['delta_qty']:+.2f}" if item_comp['delta_qty'] else '-',
-            'Заявка (цена)': f"{item_comp['request_price']:,.2f}" if item_comp['request_price'] else '-',
-            'Счет (цена)': f"{item_comp['invoice_price']:,.2f}" if item_comp['invoice_price'] else '-',
-            'Δ цены': f"{item_comp['delta_price']:+.2f}" if item_comp['delta_price'] else '-'
-        })
-
-    comp_df = pd.DataFrame(comparison_data)
-    st.markdown(comp_df.to_html(escape=False), unsafe_allow_html=True)
-
-    # Логистика и доставка
-    st.subheader("🚚 Логистика")
-
-    log_col1, log_col2, log_col3 = st.columns(3)
-
-    with log_col1:
-        st.metric("Объем груза", f"{selected_result['total_volume_m3']:.2f} м³")
-    with log_col2:
-        st.metric("Вес груза", f"{selected_result['total_weight_kg']:.0f} кг")
-    with log_col3:
-        st.metric("Тип транспорта", selected_result['transport_type'])
-
-    st.info(f"📍 Расстояние до поставщика: {selected_result['distance_km']:.1f} км")
-
-    # Предупреждения о совместимости
-    if selected_result['compatibility_warnings']:
-        st.subheader("⚠️ Проверка совместимости")
-        for warning in selected_result['compatibility_warnings']:
-            if warning['type'] == 'missing_related':
-                st.warning(warning['message'])
-            elif warning['type'] == 'potential_conflict':
-                st.error(warning['message'])
-
-    # Анализ цен
-    if selected_result['price_analysis']:
-        st.subheader("📈 Анализ истории цен")
-
-        price_changes = [p for p in selected_result['price_analysis'] if abs(p['diff_percent']) > 5]
-
-        if price_changes:
-            for pc in price_changes[:5]:  # Показываем топ-5 изменений
-                color = "red" if pc['diff_percent'] > 0 else "green"
-                st.markdown(
-                    f"- **{pc['item_name'][:40]}**: {pc['current_price']:,.2f} ₽ "
-                    f"<span style='color: {color}'>({pc['diff_percent']:+.1f}%)</span>",
-                    unsafe_allow_html=True
-                )
-
-    # Карта
-    st.subheader("🗺️ Карта поставщиков")
-
-    delivery_addr = st.session_state.request_data['delivery_address']
-    delivery_coords = get_coordinates_by_address(delivery_addr)
-
-    m = folium.Map(location=delivery_coords, zoom_start=10)
-
-    # Маркер доставки
-    folium.Marker(
-        delivery_coords,
-        popup=f"📍 Доставка: {delivery_addr}",
-        icon=folium.Icon(color='red', icon='home')
-    ).add_to(m)
-
-    # Маркеры поставщиков
-    for result in results:
-        supplier_coords = get_coordinates_by_address(
-            next((inv['supplier_address'] for inv in st.session_state.invoices_data
-                  if inv['supplier_name'] == result['supplier_name']), '')
-        )
-
-        color = 'green' if results.index(result) == best_idx else 'blue'
-
+    st.divider()
+    
+    st.subheader("🗺️ Карта доставки")
+    # Простая карта с центром в Москве (можно улучшить геокодированием адреса)
+    m = folium.Map(location=[55.7558, 37.6173], zoom_start=10, tiles="CartoDB dark_matter")
+    
+    if st.session_state.get('delivery_address'):
         folium.Marker(
-            supplier_coords,
-            popup=f"🏭 {result['supplier_name']}<br>Итого: {result['grand_total']:,.0f} ₽",
-            icon=folium.Icon(color=color, icon='building')
+            [55.7558, 37.6173], # Координаты нужно получать через геокодер
+            popup=st.session_state['delivery_address'],
+            icon=folium.Icon(color='red', icon='home')
+        ).add_to(m)
+    
+    # Точки поставщиков (случайные для демо)
+    for i, inv in enumerate(inv_list):
+        lat = 55.7558 + (i * 0.05)
+        lon = 37.6173 + (i * 0.05)
+        folium.Marker(
+            [lat, lon],
+            popup=f"Поставщик: {inv['source_file'].iloc[0]}",
+            icon=folium.Icon(color='green', icon='truck')
         ).add_to(m)
 
-    st_folium(m, width=800, height=400)
+    folium_static(m, width=800, height=400)
+    
+    # Экспорт
+    csv = res_df.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Скачать отчет (CSV)", csv, "report.csv", "text/csv")
 
-    # Экспорт результатов
-    st.subheader("💾 Экспорт")
+# --- ШАГ 3: ИСТОРИЯ ---
+elif option == "История закупок":
+    st.header("Архив закупок и цен")
+    
+    query = st.text_input("Поиск по товару или поставщику")
+    
+    # Получение данных из БД
+    # В реальном приложении здесь был бы сложный SQL запрос
+    try:
+        df_hist = pd.read_sql_query("SELECT * FROM invoices ORDER BY date DESC LIMIT 100", conn)
+        if not df_hist.empty:
+            if query:
+                mask = df_hist.apply(lambda row: row.astype(str).str.contains(query, case=False).any(), axis=1)
+                df_hist = df_hist[mask]
+            st.dataframe(df_hist, use_container_width=True)
+            
+            # График динамики цен (если есть данные)
+            if 'price' in df_hist.columns and 'name' in df_hist.columns:
+                st.subheader("Динамика цен (последние 10 позиций)")
+                # Группировка для примера
+                chart_data = df_hist.groupby('name')['price'].mean().tail(10)
+                st.bar_chart(chart_data)
+        else:
+            st.info("История пуста. Обработанные счета появятся здесь.")
+    except Exception as e:
+        st.error(f"Ошибка чтения истории: {e}")
 
-    export_col1, export_col2 = st.columns(2)
-
-    with export_col1:
-        # CSV экспорт
-        csv_data = pd.DataFrame([{
-            'Поставщик': r['supplier_name'],
-            'Сумма товаров': r['invoice_total'],
-            'Доставка': r['delivery_cost'],
-            'Итого': r['grand_total'],
-            'Объем (м³)': r['total_volume_m3'],
-            'Вес (кг)': r['total_weight_kg'],
-            'Транспорт': r['transport_type']
-        } for r in results])
-
-        st.download_button(
-            label="📥 Скачать сводку (CSV)",
-            data=csv_data.to_csv(index=False, sep=';').encode('utf-8-sig'),
-            file_name=f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
-
-    with export_col2:
-        # Excel экспорт деталей
-        detail_data = []
-        for result in results:
-            for item_comp in result['items_comparison']:
-                detail_data.append({
-                    'Поставщик': result['supplier_name'],
-                    'Позиция': item_comp['item_name'],
-                    'Статус': item_comp['status'],
-                    'Заявка_кол': item_comp['request_qty'],
-                    'Счет_кол': item_comp['invoice_qty'],
-                    'Заявка_цена': item_comp['request_price'],
-                    'Счет_цена': item_comp['invoice_price']
-                })
-
-        if detail_
-            excel_df = pd.DataFrame(detail_data)
-
-            from io import BytesIO
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                excel_df.to_excel(writer, index=False, sheet_name='Сравнение')
-
-            st.download_button(
-                label="📥 Скачать детали (Excel)",
-                data=output.getvalue(),
-                file_name=f"comparison_detail_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-# === Сайдбар ===
-with st.sidebar:
-    st.image("https://via.placeholder.com/300x100/0b132b/87ceeb?text=Главоблснаб", use_column_width=True)
-    st.markdown("### 🛠️ Инструменты")
-
-    if st.button("🔄 Начать заново"):
-        st.session_state.request_data = None
-        st.session_state.invoices_data = []
-        st.session_state.comparison_results = None
-        st.session_state.current_step = 1
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown("### ℹ️ О системе")
-    st.markdown("""
-    Система автоматического сравнения
-    счетов от поставщиков с заявкой клиента.
-
-    **Возможности:**
-    - Парсинг PDF, Excel, Word
-    - Сравнение позиций
-    - Расчет логистики
-    - Проверка совместимости
-    - История цен
-    """)
-
-    # Статистика из БД
-    suppliers = get_all_suppliers()
-    st.markdown(f"**Поставщиков в базе:** {len(suppliers)}")
+# Футер
+st.markdown("---")
+st.caption("Система разработана для ООО «Главоблснаб». Версия 1.0")
