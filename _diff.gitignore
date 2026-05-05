@@ -1,0 +1,36 @@
+--- .gitignore (原始)
+
+
++++ .gitignore (修改后)
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database
+glavobsnab_system/glavobsnab.db
+
+# Excel test files
+glavobsnab_system/test_*.xlsx
+
+# Dependencies
+venv/
+.venv/
+.env
+.env.local
+*.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+```
