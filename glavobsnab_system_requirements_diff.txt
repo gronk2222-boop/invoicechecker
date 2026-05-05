@@ -1,14 +1,12 @@
---- glavobsnab_system/requirements.txt (原始)
-
-
-+++ glavobsnab_system/requirements.txt (修改后)
-streamlit>=1.28.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-pdfplumber>=0.10.0
-python-docx>=1.1.0
-folium>=0.15.0
-requests>=2.31.0
-aiohttp>=3.9.0
-duckduckgo-search>=4.0.0
-numpy>=1.24.0
+streamlit
+pandas
+openpyxl
+pdfplumber
+python-docx
+folium
+streamlit-folium
+requests
+beautifulsoup4
+lxml
+html5lib
+xlsxwriter
